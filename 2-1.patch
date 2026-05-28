@@ -1,0 +1,608 @@
+diff --git a/mock_dashboard.py b/mock_dashboard.py
+new file mode 100644
+index 0000000..27bcde8
+--- /dev/null
++++ b/mock_dashboard.py
+@@ -0,0 +1,602 @@
++#!/usr/bin/env python3
++
++import argparse
++import asyncio
++import json
++import logging
++import math
++import random
++import time
++from contextlib import suppress
++from dataclasses import dataclass
++from datetime import datetime
++from pathlib import Path
++from typing import Any
++
++import uvicorn
++from fastapi import FastAPI, WebSocket
++from fastapi.responses import HTMLResponse, JSONResponse
++from fastapi.staticfiles import StaticFiles
++
++logging.basicConfig(
++    level=logging.INFO,
++    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
++)
++logger = logging.getLogger('mock-dashboard')
++
++DEFAULT_UPDATE_INTERVAL = 0.5
++DEFAULT_GPU_PROFILES = [
++    ('NVIDIA RTX 4090', 'Ada Lovelace', 24564.0, 450.0, 2790, 2790, 10501, 4, 16),
++    ('NVIDIA RTX 6000 Ada', 'Ada Lovelace', 49140.0, 300.0, 2520, 2520, 10001, 4, 16),
++    ('NVIDIA A100-PCIE-40GB', 'Ampere', 40960.0, 250.0, 1410, 1410, 1593, 4, 16),
++    ('NVIDIA L40S', 'Ada Lovelace', 46068.0, 350.0, 2520, 2520, 9001, 4, 16),
++    ('NVIDIA RTX 3090', 'Ampere', 24576.0, 350.0, 1695, 1695, 9751, 4, 16),
++    ('NVIDIA H100 PCIe', 'Hopper', 81480.0, 350.0, 1980, 1980, 1593, 5, 16),
++]
++PROCESS_NAMES = [
++    'python train.py',
++    'vllm serve',
++    'torchrun pretrain',
++    'tritonserver',
++    'ollama serve',
++    'comfyui',
++    'ffmpeg encode',
++    'jupyter-lab',
++]
++NODE_NAMES = [
++    'mock-node-a',
++    'mock-node-b',
++    'mock-node-c',
++    'mock-node-d',
++    'mock-node-e',
++]
++
++
++@dataclass(frozen=True)
++class GPUProfile:
++    index: int
++    name: str
++    architecture: str
++    memory_total: float
++    power_limit: float
++    clock_graphics_max: int
++    clock_sm_max: int
++    clock_memory_max: int
++    pcie_gen_max: int
++    pcie_width_max: int
++
++
++@dataclass(frozen=True)
++class NodeProfile:
++    index: int
++    name: str
++    gpus: list[GPUProfile]
++
++
++class MockScenario:
++    def __init__(
++        self,
++        mode: str,
++        interval: float,
++        seed: int,
++        default_node_name: str,
++        default_gpu_count: int,
++        hub_node_count: int,
++        hub_gpu_counts: list[int],
++    ):
++        self.mode = mode
++        self.interval = interval
++        self.random = random.Random(seed)
++        self.started_at = time.monotonic()
++        self.default_node_name = default_node_name
++        self.default_node = NodeProfile(
++            index=0,
++            name=default_node_name,
++            gpus=self._build_gpu_profiles(default_gpu_count),
++        )
++        self.hub_nodes = self._build_hub_nodes(hub_node_count, hub_gpu_counts)
++        self.energy_wh: dict[str, float] = {}
++        self.system_counters: dict[str, dict[str, float]] = {}
++        self.last_update_by_node: dict[str, str | None] = {
++            node.name: None for node in self.hub_nodes
++        }
++
++    def _build_gpu_profiles(self, count: int) -> list[GPUProfile]:
++        profiles: list[GPUProfile] = []
++        for index in range(count):
++            template = DEFAULT_GPU_PROFILES[index % len(DEFAULT_GPU_PROFILES)]
++            profiles.append(
++                GPUProfile(
++                    index=index,
++                    name=template[0],
++                    architecture=template[1],
++                    memory_total=template[2],
++                    power_limit=template[3],
++                    clock_graphics_max=template[4],
++                    clock_sm_max=template[5],
++                    clock_memory_max=template[6],
++                    pcie_gen_max=template[7],
++                    pcie_width_max=template[8],
++                )
++            )
++        return profiles
++
++    def _build_hub_nodes(self, node_count: int, hub_gpu_counts: list[int]) -> list[NodeProfile]:
++        nodes: list[NodeProfile] = []
++        normalized_counts = hub_gpu_counts or [2]
++        while len(normalized_counts) < node_count:
++            normalized_counts.append(normalized_counts[-1])
++
++        for index in range(node_count):
++            name = NODE_NAMES[index] if index < len(NODE_NAMES) else f'mock-node-{index + 1}'
++            nodes.append(
++                NodeProfile(
++                    index=index,
++                    name=name,
++                    gpus=self._build_gpu_profiles(max(normalized_counts[index], 1)),
++                )
++            )
++        return nodes
++
++    def build_payload(self) -> dict[str, Any]:
++        if self.mode == 'hub':
++            return self._build_hub_payload()
++        return self._build_default_payload()
++
++    def _elapsed(self) -> float:
++        return time.monotonic() - self.started_at
++
++    def _node_online(self, node: NodeProfile, elapsed: float) -> bool:
++        if node.index == 0:
++            return True
++        cycle = 36.0
++        phase = (elapsed + node.index * 5.5) % cycle
++        if node.index == 1:
++            return not (12.0 <= phase < 20.0)
++        if node.index == 2:
++            return phase >= 6.0 and not (24.0 <= phase < 31.0)
++        block = int(phase // 9.0)
++        return block not in {1}
++
++    def _build_default_payload(self) -> dict[str, Any]:
++        elapsed = self._elapsed()
++        system = self._build_system_info(self.default_node.name, elapsed, 0.72)
++        gpus: dict[str, dict[str, Any]] = {}
++        processes: list[dict[str, Any]] = []
++
++        for gpu in self.default_node.gpus:
++            gpu_metrics = self._build_gpu_metrics(self.default_node, gpu, elapsed)
++            gpu_id = str(gpu.index)
++            gpus[gpu_id] = gpu_metrics
++            processes.extend(
++                self._build_processes(self.default_node, gpu, gpu_metrics, elapsed)
++            )
++
++        return {
++            'mode': 'default',
++            'node_name': self.default_node.name,
++            'gpus': gpus,
++            'processes': processes,
++            'system': system,
++        }
++
++    def _build_hub_payload(self) -> dict[str, Any]:
++        elapsed = self._elapsed()
++        nodes: dict[str, dict[str, Any]] = {}
++        online_nodes = 0
++        total_gpus = 0
++
++        for node in self.hub_nodes:
++            is_online = self._node_online(node, elapsed)
++            if is_online:
++                intensity = min(0.45 + node.index * 0.18, 0.92)
++                system = self._build_system_info(node.name, elapsed, intensity)
++                gpus: dict[str, dict[str, Any]] = {}
++                processes: list[dict[str, Any]] = []
++                for gpu in node.gpus:
++                    gpu_metrics = self._build_gpu_metrics(node, gpu, elapsed)
++                    gpu_id = str(gpu.index)
++                    gpus[gpu_id] = gpu_metrics
++                    processes.extend(self._build_processes(node, gpu, gpu_metrics, elapsed))
++                timestamp = system['timestamp']
++                self.last_update_by_node[node.name] = timestamp
++                nodes[node.name] = {
++                    'status': 'online',
++                    'gpus': gpus,
++                    'processes': processes,
++                    'system': system,
++                    'last_update': timestamp,
++                }
++                online_nodes += 1
++                total_gpus += len(gpus)
++            else:
++                nodes[node.name] = {
++                    'status': 'offline',
++                    'gpus': {},
++                    'processes': [],
++                    'system': {},
++                    'last_update': self.last_update_by_node.get(node.name),
++                }
++
++        return {
++            'mode': 'hub',
++            'nodes': nodes,
++            'cluster_stats': {
++                'total_nodes': len(self.hub_nodes),
++                'online_nodes': online_nodes,
++                'total_gpus': total_gpus,
++            },
++        }
++
++    def _build_gpu_metrics(self, node: NodeProfile, gpu: GPUProfile, elapsed: float) -> dict[str, Any]:
++        phase = elapsed * (0.55 + gpu.index * 0.05) + node.index * 0.9 + gpu.index * 0.7
++        util_base = 58 + 28 * math.sin(phase)
++        util_ripple = 14 * math.sin(phase * 0.43 + 1.4)
++        utilization = self._clamp(util_base + util_ripple, 4, 99)
++        memory_ratio = self._clamp(0.28 + utilization / 135 + 0.1 * math.sin(phase / 2.4), 0.08, 0.96)
++        memory_used = round(gpu.memory_total * memory_ratio, 1)
++        power_draw = round(self._clamp(gpu.power_limit * (0.2 + utilization / 110), 25, gpu.power_limit * 0.98), 1)
++        fan_speed = int(self._clamp(18 + utilization * 0.72 + 7 * math.sin(phase * 0.6), 15, 100))
++        temperature = int(self._clamp(34 + utilization * 0.47 + 3 * math.sin(phase / 3), 28, 91))
++        mem_ctrl = int(self._clamp(memory_ratio * 100 + 8 * math.sin(phase / 4), 4, 100))
++        graphics_clock = int(self._clamp(gpu.clock_graphics_max * (0.38 + utilization / 150), 300, gpu.clock_graphics_max))
++        sm_clock = int(self._clamp(gpu.clock_sm_max * (0.36 + utilization / 155), 300, gpu.clock_sm_max))
++        memory_clock = int(self._clamp(gpu.clock_memory_max * (0.52 + memory_ratio * 0.45), 800, gpu.clock_memory_max))
++        encoder_util = int(self._clamp(utilization * 0.22 + 16 * max(math.sin(phase * 0.33), 0), 0, 100))
++        decoder_util = int(self._clamp(utilization * 0.12 + 10 * max(math.cos(phase * 0.29), 0), 0, 100))
++        process_count = 0 if utilization < 18 else 1 if utilization < 52 else 2 if utilization < 82 else 3
++        key = f'{node.name}-{gpu.index}'
++        energy = self.energy_wh.get(key, 0.0) + (power_draw * self.interval) / 3600
++        self.energy_wh[key] = energy
++
++        return {
++            'index': str(gpu.index),
++            'name': gpu.name,
++            'uuid': f'GPU-{node.name}-{gpu.index:02d}',
++            'driver_version': '555.85',
++            'vbios_version': f'95.{gpu.index}{node.index}.12.00.01',
++            'brand': 'NVIDIA',
++            'architecture': gpu.architecture,
++            'cuda_compute_capability': self._compute_capability(gpu.architecture),
++            'temperature': temperature,
++            'temperature_memory': min(temperature + 8, 104),
++            'utilization': int(utilization),
++            'memory_utilization': mem_ctrl,
++            'memory_used': memory_used,
++            'memory_total': gpu.memory_total,
++            'memory_free': round(max(gpu.memory_total - memory_used, 0), 1),
++            'power_draw': power_draw,
++            'power_limit': gpu.power_limit,
++            'fan_speed': fan_speed,
++            'clock_graphics': graphics_clock,
++            'clock_sm': sm_clock,
++            'clock_memory': memory_clock,
++            'clock_graphics_max': gpu.clock_graphics_max,
++            'clock_sm_max': gpu.clock_sm_max,
++            'clock_memory_max': gpu.clock_memory_max,
++            'pcie_gen': min(gpu.pcie_gen_max, 4 if utilization > 25 else 1),
++            'pcie_gen_max': gpu.pcie_gen_max,
++            'pcie_width': gpu.pcie_width_max if utilization > 15 else max(gpu.pcie_width_max // 4, 4),
++            'pcie_width_max': gpu.pcie_width_max,
++            'encoder_sessions': min(process_count, 2),
++            'encoder_fps': 0 if encoder_util == 0 else round(22 + encoder_util * 0.9, 1),
++            'encoder_latency': 0 if encoder_util == 0 else round(3.5 + encoder_util / 28, 1),
++            'encoder_utilization': encoder_util,
++            'decoder_sessions': 1 if decoder_util > 18 else 0,
++            'decoder_fps': 0 if decoder_util == 0 else round(18 + decoder_util * 0.75, 1),
++            'decoder_latency': 0 if decoder_util == 0 else round(2.0 + decoder_util / 33, 1),
++            'decoder_utilization': decoder_util,
++            'performance_state': self._performance_state(utilization),
++            'compute_mode': 'Default',
++            'throttle_reasons': 'None' if temperature < 84 else 'Thermal Slowdown',
++            'compute_processes_count': process_count,
++            'graphics_processes_count': 0,
++            'energy_consumption_wh': round(energy, 3),
++            'timestamp': datetime.now().isoformat(),
++            '_fallback_mode': False,
++        }
++
++    def _build_processes(
++        self,
++        node: NodeProfile,
++        gpu: GPUProfile,
++        gpu_metrics: dict[str, Any],
++        elapsed: float,
++    ) -> list[dict[str, Any]]:
++        process_count = int(gpu_metrics.get('compute_processes_count', 0))
++        if process_count == 0:
++            return []
++
++        total_memory = float(gpu_metrics['memory_used'])
++        names_offset = int(elapsed / 6) + node.index + gpu.index
++        memory_slices = [0.48, 0.31, 0.18]
++        processes = []
++
++        for slot in range(process_count):
++            memory = round(max(total_memory * memory_slices[slot] - slot * 120, 256), 1)
++            processes.append({
++                'pid': str(4100 + node.index * 1000 + gpu.index * 100 + slot * 7),
++                'name': PROCESS_NAMES[(names_offset + slot) % len(PROCESS_NAMES)],
++                'gpu_uuid': gpu_metrics['uuid'],
++                'gpu_id': str(gpu.index),
++                'memory': memory,
++            })
++
++        return processes
++
++    def _build_system_info(self, source_key: str, elapsed: float, intensity: float) -> dict[str, Any]:
++        phase = elapsed * 0.32 + len(source_key) * 0.17
++        cpu_percent = self._clamp(26 + intensity * 55 + 12 * math.sin(phase), 4, 98)
++        memory_percent = self._clamp(34 + intensity * 42 + 6 * math.sin(phase / 2.2), 10, 97)
++        memory_total_gb = 256.0 if intensity > 0.7 else 128.0
++        memory_used_gb = round(memory_total_gb * (memory_percent / 100), 2)
++        counters = self.system_counters.setdefault(
++            source_key,
++            {
++                'net_bytes_sent': float((1 + len(source_key)) * 2_500_000_000),
++                'net_bytes_recv': float((1 + len(source_key)) * 3_400_000_000),
++                'disk_read_bytes': float((1 + len(source_key)) * 6_800_000_000),
++                'disk_write_bytes': float((1 + len(source_key)) * 5_100_000_000),
++            },
++        )
++
++        net_rx_rate = 1_800_000 + intensity * 2_900_000 + max(math.sin(phase * 1.8), 0) * 1_500_000
++        net_tx_rate = 950_000 + intensity * 1_900_000 + max(math.cos(phase * 1.4), 0) * 900_000
++        disk_read_rate = 650_000 + intensity * 1_100_000 + max(math.sin(phase * 1.3), 0) * 800_000
++        disk_write_rate = 540_000 + intensity * 920_000 + max(math.cos(phase * 1.1), 0) * 720_000
++
++        counters['net_bytes_recv'] += net_rx_rate * self.interval
++        counters['net_bytes_sent'] += net_tx_rate * self.interval
++        counters['disk_read_bytes'] += disk_read_rate * self.interval
++        counters['disk_write_bytes'] += disk_write_rate * self.interval
++
++        cpu_freq_max = 3600.0 if intensity < 0.8 else 4100.0
++        cpu_freq_current = round(self._clamp(cpu_freq_max * (0.58 + cpu_percent / 180), 900, cpu_freq_max), 0)
++        load_1 = round(cpu_percent / 24 + intensity * 3.8, 2)
++        load_5 = round(load_1 * 0.88, 2)
++        load_15 = round(load_1 * 0.74, 2)
++
++        return {
++            'cpu_percent': round(cpu_percent, 1),
++            'memory_percent': round(memory_percent, 1),
++            'memory_total_gb': memory_total_gb,
++            'memory_used_gb': memory_used_gb,
++            'memory_available_gb': round(memory_total_gb - memory_used_gb, 2),
++            'cpu_count': 32 if intensity < 0.8 else 64,
++            'timestamp': datetime.now().isoformat(),
++            'swap_percent': round(self._clamp(memory_percent * 0.22, 0, 48), 1),
++            'cpu_freq_current': cpu_freq_current,
++            'cpu_freq_max': cpu_freq_max,
++            'load_avg_1': load_1,
++            'load_avg_5': load_5,
++            'load_avg_15': load_15,
++            'net_bytes_sent': int(counters['net_bytes_sent']),
++            'net_bytes_recv': int(counters['net_bytes_recv']),
++            'disk_read_bytes': int(counters['disk_read_bytes']),
++            'disk_write_bytes': int(counters['disk_write_bytes']),
++        }
++
++    @staticmethod
++    def _clamp(value: float, low: float, high: float) -> float:
++        return max(low, min(high, value))
++
++    @staticmethod
++    def _compute_capability(architecture: str) -> str:
++        mapping = {
++            'Ampere': '8.0',
++            'Ada Lovelace': '8.9',
++            'Hopper': '9.0',
++        }
++        return mapping.get(architecture, '8.6')
++
++    @staticmethod
++    def _performance_state(utilization: float) -> str:
++        if utilization >= 88:
++            return 'P0'
++        if utilization >= 72:
++            return 'P1'
++        if utilization >= 55:
++            return 'P2'
++        if utilization >= 35:
++            return 'P3'
++        if utilization >= 18:
++            return 'P5'
++        return 'P8'
++
++
++def create_mock_app(root_dir: Path, scenario: MockScenario, interval: float, label: str) -> FastAPI:
++    app = FastAPI(title=f'GPU Hot Mock {label.upper()}')
++    app.mount('/static', StaticFiles(directory=str(root_dir / 'static')), name='static')
++    app.state.connections = set()
++    app.state.streaming_started = False
++
++    async def stream_loop() -> None:
++        while True:
++            payload = scenario.build_payload()
++            if app.state.connections:
++                disconnected = set()
++                message = json.dumps(payload)
++                for websocket in list(app.state.connections):
++                    try:
++                        await websocket.send_text(message)
++                    except Exception:
++                        disconnected.add(websocket)
++                app.state.connections -= disconnected
++            await asyncio.sleep(interval)
++
++    @app.get('/')
++    async def index() -> HTMLResponse:
++        return HTMLResponse((root_dir / 'templates' / 'index.html').read_text())
++
++    @app.get('/api/gpu-data')
++    async def gpu_data() -> JSONResponse:
++        return JSONResponse(scenario.build_payload())
++
++    @app.get('/api/version')
++    async def version() -> JSONResponse:
++        return JSONResponse({
++            'current': f'mock-{label}',
++            'latest': None,
++            'update_available': False,
++            'release_url': None,
++        })
++
++    @app.websocket('/socket.io/')
++    async def websocket_endpoint(websocket: WebSocket) -> None:
++        await websocket.accept()
++        app.state.connections.add(websocket)
++        logger.info('Client connected to %s mock', label)
++
++        if not app.state.streaming_started:
++            app.state.streaming_started = True
++            asyncio.create_task(stream_loop())
++
++        try:
++            while True:
++                await websocket.receive_text()
++        except Exception:
++            pass
++        finally:
++            app.state.connections.discard(websocket)
++            logger.info('Client disconnected from %s mock', label)
++
++    return app
++
++
++async def serve_app(app: FastAPI, host: str, port: int, label: str) -> None:
++    logger.info('%s mock dashboard: http://%s:%s', label.capitalize(), host, port)
++    config = uvicorn.Config(app, host=host, port=port, log_level='info')
++    server = uvicorn.Server(config)
++    await server.serve()
++
++
++def parse_gpu_counts(raw: str) -> list[int]:
++    values = [chunk.strip() for chunk in raw.split(',') if chunk.strip()]
++    if not values:
++        return [2]
++    return [max(int(value), 1) for value in values]
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description='GPU Hot local mock dashboard server')
++    parser.add_argument('--mode', choices=['default', 'hub', 'dual'], default='dual')
++    parser.add_argument('--host', default='127.0.0.1')
++    parser.add_argument('--port', type=int, default=18112)
++    parser.add_argument('--default-port', type=int, default=18112)
++    parser.add_argument('--hub-port', type=int, default=18113)
++    parser.add_argument('--interval', type=float, default=DEFAULT_UPDATE_INTERVAL)
++    parser.add_argument('--seed', type=int, default=7)
++    parser.add_argument('--default-node-name', default='mock-workstation')
++    parser.add_argument('--default-gpus', type=int, default=4)
++    parser.add_argument('--hub-nodes', type=int, default=3)
++    parser.add_argument('--hub-gpus-per-node', default='2,4,1')
++    parser.add_argument('--print-sample', action='store_true')
++    return parser
++
++
++def build_sample_payloads(args: argparse.Namespace) -> list[tuple[str, dict[str, Any]]]:
++    hub_gpu_counts = parse_gpu_counts(args.hub_gpus_per_node)
++    payloads: list[tuple[str, dict[str, Any]]] = []
++
++    if args.mode in {'default', 'dual'}:
++        scenario = MockScenario(
++            mode='default',
++            interval=args.interval,
++            seed=args.seed,
++            default_node_name=args.default_node_name,
++            default_gpu_count=max(args.default_gpus, 1),
++            hub_node_count=max(args.hub_nodes, 1),
++            hub_gpu_counts=hub_gpu_counts,
++        )
++        payloads.append(('default', scenario.build_payload()))
++
++    if args.mode in {'hub', 'dual'}:
++        scenario = MockScenario(
++            mode='hub',
++            interval=args.interval,
++            seed=args.seed + 1,
++            default_node_name=args.default_node_name,
++            default_gpu_count=max(args.default_gpus, 1),
++            hub_node_count=max(args.hub_nodes, 1),
++            hub_gpu_counts=hub_gpu_counts,
++        )
++        payloads.append(('hub', scenario.build_payload()))
++
++    return payloads
++
++
++async def run(args: argparse.Namespace) -> None:
++    root_dir = Path(__file__).resolve().parent
++    hub_gpu_counts = parse_gpu_counts(args.hub_gpus_per_node)
++
++    if args.print_sample:
++        for label, payload in build_sample_payloads(args):
++            print(f'[{label}]')
++            print(json.dumps(payload, indent=2, ensure_ascii=False))
++        return
++
++    if args.mode == 'default':
++        scenario = MockScenario(
++            mode='default',
++            interval=args.interval,
++            seed=args.seed,
++            default_node_name=args.default_node_name,
++            default_gpu_count=max(args.default_gpus, 1),
++            hub_node_count=max(args.hub_nodes, 1),
++            hub_gpu_counts=hub_gpu_counts,
++        )
++        app = create_mock_app(root_dir, scenario, args.interval, 'default')
++        await serve_app(app, args.host, args.port, 'default')
++        return
++
++    if args.mode == 'hub':
++        scenario = MockScenario(
++            mode='hub',
++            interval=args.interval,
++            seed=args.seed + 1,
++            default_node_name=args.default_node_name,
++            default_gpu_count=max(args.default_gpus, 1),
++            hub_node_count=max(args.hub_nodes, 1),
++            hub_gpu_counts=hub_gpu_counts,
++        )
++        app = create_mock_app(root_dir, scenario, args.interval, 'hub')
++        await serve_app(app, args.host, args.port, 'hub')
++        return
++
++    default_scenario = MockScenario(
++        mode='default',
++        interval=args.interval,
++        seed=args.seed,
++        default_node_name=args.default_node_name,
++        default_gpu_count=max(args.default_gpus, 1),
++        hub_node_count=max(args.hub_nodes, 1),
++        hub_gpu_counts=hub_gpu_counts,
++    )
++    hub_scenario = MockScenario(
++        mode='hub',
++        interval=args.interval,
++        seed=args.seed + 1,
++        default_node_name=args.default_node_name,
++        default_gpu_count=max(args.default_gpus, 1),
++        hub_node_count=max(args.hub_nodes, 1),
++        hub_gpu_counts=hub_gpu_counts,
++    )
++    default_app = create_mock_app(root_dir, default_scenario, args.interval, 'default')
++    hub_app = create_mock_app(root_dir, hub_scenario, args.interval, 'hub')
++
++    tasks = [
++        asyncio.create_task(serve_app(default_app, args.host, args.default_port, 'default')),
++        asyncio.create_task(serve_app(hub_app, args.host, args.hub_port, 'hub')),
++    ]
++
++    try:
++        await asyncio.gather(*tasks)
++    finally:
++        for task in tasks:
++            task.cancel()
++            with suppress(asyncio.CancelledError):
++                await task
++
++
++if __name__ == '__main__':
++    asyncio.run(run(build_parser().parse_args()))
