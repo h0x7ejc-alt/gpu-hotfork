@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""GPU Hot Mock Server - Local development tool for testing dashboard without real GPUs"""
+
+import asyncio
+import json
+import random
+import logging
+from datetime import datetime
+from fastapi import FastAPI, WebSocket
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="GPU Hot Mock Server", version="0.1.0")
+
+# Serve static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Mock data state
+mock_state = {
+    'mode': 'default',  # Can be 'default' or 'hub'
+    'nodes': {
+        'node-0': {
+            'name': 'node-0',
+            'status': 'online',
+            'gpu_count': 2
+        },
+        'node-1': {
+            'name': 'node-1',
+            'status': 'online',
+            'gpu_count': 4
+        },
+        'node-2': {
+            'name': 'node-2',
+            'status': 'online',
+            'gpu_count': 2
+        }
+    }
+}
+
+# WebSocket connections
+websocket_connections = set()
+
+# GPU models for mock data
+GPU_MODELS = [
+    {'name': 'NVIDIA GeForce RTX 4090', 'memory_total': 24576, 'power_limit': 450},
+    {'name': 'NVIDIA GeForce RTX 3090', 'memory_total': 24576, 'power_limit': 350},
+    {'name': 'NVIDIA A100 80GB', 'memory_total': 81920, 'power_limit': 400},
+    {'name': 'NVIDIA A10G', 'memory_total': 24576, 'power_limit': 300},
+    {'name': 'NVIDIA H100', 'memory_total': 80000, 'power_limit': 700},
+    {'name': 'NVIDIA L4', 'memory_total': 24576, 'power_limit': 72}
+]
+
+
+def generate_mock_gpu_data(gpu_id, model):
+    """Generate mock GPU data for a single GPU"""
+    utilization = random.uniform(0, 100)
+    memory_utilization = random.uniform(0, 100)
+    memory_used = (memory_utilization / 100) * model['memory_total']
+    temperature = random.uniform(35, 85)
+    power_draw = random.uniform(model['power_limit'] * 0.1, model['power_limit'] * 0.8)
+    fan_speed = random.uniform(0, 100) if temperature > 50 else random.uniform(0, 30)
+    
+    return {
+        'index': str(gpu_id),
+        'timestamp': datetime.now().isoformat(),
+        'name': model['name'],
+        'uuid': f'GPU-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}',
+        'driver_version': '550.54.15',
+        'vbios_version': '94.02.71.40.4D',
+        'brand': 'NVIDIA',
+        'architecture': random.choice(['Ampere', 'Ada Lovelace', 'Hopper']),
+        'cuda_compute_capability': '8.9',
+        'serial': f'SN{random.randint(100000, 999999)}',
+        'utilization': utilization,
+        'memory_utilization': memory_utilization,
+        'performance_state': f'P{random.randint(0, 12)}',
+        'compute_mode': 'Default',
+        'memory_used': memory_used,
+        'memory_total': model['memory_total'],
+        'memory_free': model['memory_total'] - memory_used,
+        'bar1_memory_used': random.uniform(0, 1024),
+        'bar1_memory_total': 1024,
+        'temperature': temperature,
+        'temperature_memory': temperature + random.uniform(-5, 5),
+        'power_draw': power_draw,
+        'power_limit': model['power_limit'],
+        'power_limit_min': model['power_limit'] * 0.5,
+        'power_limit_max': model['power_limit'] * 1.2,
+        'energy_consumption': random.uniform(0, 1000),
+        'energy_consumption_wh': random.uniform(0, 10),
+        'fan_speed': fan_speed,
+        'throttle_reasons': 'None' if temperature < 80 else 'HW Thermal',
+        'clock_graphics': random.uniform(1000, 2500),
+        'clock_graphics_max': random.uniform(2000, 3000),
+        'clock_sm': random.uniform(1000, 2500),
+        'clock_sm_max': random.uniform(2000, 3000),
+        'clock_memory': random.uniform(5000, 10000),
+        'clock_memory_max': random.uniform(8000, 12000),
+        'clock_video': random.uniform(500, 1500),
+        'clock_video_max': random.uniform(1000, 2000),
+        'pcie_gen': str(random.randint(3, 5)),
+        'pcie_gen_max': '5',
+        'pcie_width': '16',
+        'pcie_width_max': '16',
+        'pcie_tx_throughput': random.uniform(0, 1000),
+        'pcie_rx_throughput': random.uniform(0, 1000),
+        'pci_bus_id': f'0000:{random.randint(0, 99):02x}:00.0',
+        'encoder_utilization': random.uniform(0, 100) if random.random() > 0.5 else None,
+        'decoder_utilization': random.uniform(0, 100) if random.random() > 0.5 else None,
+        'compute_processes_count': random.randint(0, 3),
+        'graphics_processes_count': random.randint(0, 2),
+        'persistence_mode': 'Enabled',
+        'display_active': random.choice([True, False])
+    }
+
+
+def generate_mock_system_data():
+    """Generate mock system metrics"""
+    cpu_percent = random.uniform(0, 100)
+    memory_percent = random.uniform(0, 100)
+    memory_total_gb = random.choice([32, 64, 128, 256])
+    memory_used_gb = (memory_percent / 100) * memory_total_gb
+    
+    return {
+        'cpu_percent': cpu_percent,
+        'memory_percent': memory_percent,
+        'memory_total_gb': memory_total_gb,
+        'memory_used_gb': memory_used_gb,
+        'memory_available_gb': memory_total_gb - memory_used_gb,
+        'cpu_count': random.choice([8, 16, 32, 64, 128]),
+        'timestamp': datetime.now().isoformat(),
+        'load_avg_1': random.uniform(0, 10),
+        'load_avg_5': random.uniform(0, 10),
+        'load_avg_15': random.uniform(0, 10),
+        'net_bytes_sent': random.uniform(0, 1e9),
+        'net_bytes_recv': random.uniform(0, 1e9),
+        'disk_read_bytes': random.uniform(0, 1e9),
+        'disk_write_bytes': random.uniform(0, 1e9)
+    }
+
+
+def generate_mock_processes(gpus):
+    """Generate mock process data"""
+    processes = []
+    process_names = ['python', 'python3', 'train.py', 'inference.py', 'stable-diffusion', 'llama.cpp']
+    
+    for gpu_id, gpu_data in gpus.items():
+        if random.random() > 0.5:
+            num_procs = random.randint(1, 3)
+            for _ in range(num_procs):
+                processes.append({
+                    'pid': str(random.randint(1000, 99999)),
+                    'name': random.choice(process_names),
+                    'gpu_uuid': gpu_data['uuid'],
+                    'gpu_id': gpu_id,
+                    'memory': random.uniform(1024, gpu_data['memory_total'] * 0.8)
+                })
+    
+    return processes
+
+
+def generate_default_mode_data(node_name='mock-node'):
+    """Generate data for default (single node) mode"""
+    gpus = {}
+    gpu_count = random.choice([1, 2, 4, 8])
+    
+    for i in range(gpu_count):
+        model = random.choice(GPU_MODELS)
+        gpus[str(i)] = generate_mock_gpu_data(i, model)
+    
+    processes = generate_mock_processes(gpus)
+    system = generate_mock_system_data()
+    
+    return {
+        'mode': 'default',
+        'node_name': node_name,
+        'gpus': gpus,
+        'processes': processes,
+        'system': system
+    }
+
+
+def generate_hub_mode_data():
+    """Generate data for hub (multi-node) mode"""
+    nodes = {}
+    total_gpus = 0
+    online_nodes = 0
+    
+    for node_name, node_config in mock_state['nodes'].items():
+        if node_config['status'] == 'online':
+            online_nodes += 1
+            gpus = {}
+            
+            for i in range(node_config['gpu_count']):
+                model = random.choice(GPU_MODELS)
+                gpus[str(i)] = generate_mock_gpu_data(i, model)
+            
+            total_gpus += len(gpus)
+            processes = generate_mock_processes(gpus)
+            system = generate_mock_system_data()
+            
+            nodes[node_name] = {
+                'status': 'online',
+                'gpus': gpus,
+                'processes': processes,
+                'system': system,
+                'last_update': datetime.now().isoformat()
+            }
+        else:
+            nodes[node_name] = {
+                'status': 'offline',
+                'gpus': {},
+                'processes': [],
+                'system': {},
+                'last_update': datetime.now().isoformat()
+            }
+    
+    return {
+        'mode': 'hub',
+        'nodes': nodes,
+        'cluster_stats': {
+            'total_nodes': len(mock_state['nodes']),
+            'online_nodes': online_nodes,
+            'total_gpus': total_gpus
+        }
+    }
+
+
+async def monitor_loop():
+    """Background loop that sends mock data to WebSocket clients"""
+    logger.info("Mock monitor loop started")
+    
+    while True:
+        try:
+            if mock_state['mode'] == 'hub':
+                data = generate_hub_mode_data()
+            else:
+                data = generate_default_mode_data()
+            
+            # Send to all connected clients
+            if websocket_connections:
+                disconnected = set()
+                for websocket in list(websocket_connections):
+                    try:
+                        await websocket.send_text(json.dumps(data))
+                    except Exception:
+                        disconnected.add(websocket)
+                
+                websocket_connections -= disconnected
+                
+        except Exception as e:
+            logger.error(f"Error in mock monitor loop: {e}")
+        
+        await asyncio.sleep(0.5)
+
+
+@app.websocket("/socket.io/")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for mock data"""
+    await websocket.accept()
+    websocket_connections.add(websocket)
+    logger.info('Dashboard client connected')
+    
+    # Start monitor loop if not already running
+    if len(websocket_connections) == 1:
+        asyncio.create_task(monitor_loop())
+    
+    try:
+        # Keep connection alive
+        while True:
+            await websocket.receive_text()
+    except Exception as e:
+        logger.debug(f'Dashboard client disconnected: {e}')
+    finally:
+        websocket_connections.discard(websocket)
+
+
+@app.get("/")
+async def index():
+    """Serve the main dashboard"""
+    with open("templates/index.html", "r") as f:
+        return HTMLResponse(content=f.read())
+
+
+@app.get("/api/mode/{new_mode}")
+async def set_mode(new_mode: str):
+    """Switch between default and hub modes"""
+    if new_mode in ['default', 'hub']:
+        mock_state['mode'] = new_mode
+        logger.info(f"Switched to {new_mode} mode")
+        return {"status": "success", "mode": new_mode}
+    return {"status": "error", "message": "Invalid mode"}
+
+
+@app.get("/api/node/{node_name}/status/{new_status}")
+async def toggle_node_status(node_name: str, new_status: str):
+    """Toggle node online/offline status (hub mode)"""
+    if node_name in mock_state['nodes'] and new_status in ['online', 'offline']:
+        mock_state['nodes'][node_name]['status'] = new_status
+        logger.info(f"Set {node_name} status to {new_status}")
+        return {"status": "success", "node": node_name, "node_status": new_status}
+    return {"status": "error", "message": "Invalid node or status"}
+
+
+@app.get("/api/nodes")
+async def get_nodes():
+    """Get current node configuration"""
+    return {"nodes": mock_state['nodes']}
+
+
+@app.get("/api/mode")
+async def get_mode():
+    """Get current mode"""
+    return {"mode": mock_state['mode']}
+
+
+if __name__ == '__main__':
+    import uvicorn
+    print("\n" + "="*60)
+    print("GPU Hot Mock Server")
+    print("="*60)
+    print("\nThis server provides mock GPU data for testing the dashboard")
+    print("without requiring real NVIDIA GPUs or nodes.")
+    print("\nAvailable API endpoints:")
+    print("  - /api/mode/default   : Switch to single-node mode")
+    print("  - /api/mode/hub       : Switch to multi-node hub mode")
+    print("  - /api/node/<name>/status/<online|offline> : Toggle node status")
+    print("  - /api/nodes          : Get current node configuration")
+    print("  - /api/mode           : Get current mode")
+    print("\n" + "="*60)
+    print("\nServer starting on http://0.0.0.0:1312\n")
+    
+    uvicorn.run(app, host='0.0.0.0', port=1312, log_level="info")
