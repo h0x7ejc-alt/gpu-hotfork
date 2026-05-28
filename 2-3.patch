@@ -1,0 +1,519 @@
+diff --git a/mock_server.py b/mock_server.py
+new file mode 100644
+index 0000000..b7163e5
+--- /dev/null
++++ b/mock_server.py
+@@ -0,0 +1,512 @@
++#!/usr/bin/env python3
++"""GPU Hot Mock Server — local debugging tool that simulates GPU nodes.
++
++No real GPU or NVIDIA driver required.  The frontend dashboard connects to
++this server exactly as it would to a real gpu-hot instance.
++
++Usage (run from the repo root so static/ and templates/ are found)::
++
++    python mock_server.py                  # default mode, 4 GPUs
++    python mock_server.py --mode hub       # hub mode, 3 nodes × 2 GPUs
++    python mock_server.py --mode hub --nodes 5 --gpus 4 --scenario random-offline
++"""
++
++from __future__ import annotations
++
++import argparse
++import asyncio
++import json
++import logging
++import math
++import os
++import random
++import sys
++import time
++from datetime import datetime, timezone
++from pathlib import Path
++
++from fastapi import FastAPI, WebSocket
++from fastapi.responses import HTMLResponse
++from fastapi.staticfiles import StaticFiles
++
++# ── helpers ──────────────────────────────────────────────────────────────
++
++def _fluctuate(base: float, pct: float = 5.0) -> float:
++    """Return *base* perturbed by ±*pct*% (reproducible-ish walk)."""
++    delta = base * (pct / 100.0)
++    return round(base + random.uniform(-delta, delta), 2)
++
++
++def _walk(value: float, step_max: float, floor: float, ceil: float) -> float:
++    """Random-walk *value* within [*floor*, *ceil*]."""
++    value += random.uniform(-step_max, step_max)
++    return round(max(floor, min(ceil, value)), 2)
++
++
++# ── mock GPU data generator ──────────────────────────────────────────────
++
++GPU_PRESETS = [
++    {"name": "NVIDIA GeForce RTX 4090", "brand": "GeForce RTX", "architecture": "Ada Lovelace",
++     "memory_total": 24564, "cuda_compute_capability": "8.9",
++     "pcie_gen": "4", "pcie_gen_max": "4", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA GeForce RTX 4080", "brand": "GeForce RTX", "architecture": "Ada Lovelace",
++     "memory_total": 16376, "cuda_compute_capability": "8.9",
++     "pcie_gen": "4", "pcie_gen_max": "4", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA A100-SXM4-80GB",   "brand": "Tesla", "architecture": "Ampere",
++     "memory_total": 81920, "cuda_compute_capability": "8.0",
++     "pcie_gen": "4", "pcie_gen_max": "4", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA H100 PCIe",         "brand": "Tesla", "architecture": "Hopper",
++     "memory_total": 81590, "cuda_compute_capability": "9.0",
++     "pcie_gen": "5", "pcie_gen_max": "5", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA RTX 6000 Ada",      "brand": "Quadro", "architecture": "Ada Lovelace",
++     "memory_total": 49152, "cuda_compute_capability": "8.9",
++     "pcie_gen": "4", "pcie_gen_max": "4", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA TITAN RTX",         "brand": "Titan RTX", "architecture": "Turing",
++     "memory_total": 24576, "cuda_compute_capability": "7.5",
++     "pcie_gen": "3", "pcie_gen_max": "3", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA GeForce RTX 3090",  "brand": "GeForce RTX", "architecture": "Ampere",
++     "memory_total": 24564, "cuda_compute_capability": "8.6",
++     "pcie_gen": "4", "pcie_gen_max": "4", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA L40S",              "brand": "Tesla", "architecture": "Ada Lovelace",
++     "memory_total": 49152, "cuda_compute_capability": "8.9",
++     "pcie_gen": "4", "pcie_gen_max": "4", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA V100-SXM2-32GB",    "brand": "Tesla", "architecture": "Volta",
++     "memory_total": 32768, "cuda_compute_capability": "7.0",
++     "pcie_gen": "3", "pcie_gen_max": "3", "pcie_width": "16", "pcie_width_max": "16"},
++    {"name": "NVIDIA A40",               "brand": "Tesla", "architecture": "Ampere",
++     "memory_total": 49152, "cuda_compute_capability": "8.6",
++     "pcie_gen": "4", "pcie_gen_max": "4", "pcie_width": "16", "pcie_width_max": "16"},
++]
++
++
++def _make_static_gpu(preset: dict, gpu_id: str, pci_bus_id: str) -> dict:
++    """Return the static part of a GPU report (never changes)."""
++    return {
++        "index": gpu_id,
++        "name": preset["name"],
++        "uuid": f"GPU-{random.randbytes(8).hex().upper()}",
++        "driver_version": "550.127.05",
++        "vbios_version": "95.02.3C.00.01",
++        "brand": preset["brand"],
++        "architecture": preset["architecture"],
++        "cuda_compute_capability": preset["cuda_compute_capability"],
++        "serial": f"{random.randint(1000000000, 9999999999)}",
++        "compute_mode": "Default",
++        "memory_total": preset["memory_total"],
++        "pcie_gen": preset["pcie_gen"],
++        "pcie_gen_max": preset["pcie_gen_max"],
++        "pcie_width": preset["pcie_width"],
++        "pcie_width_max": preset["pcie_width_max"],
++        "pci_bus_id": pci_bus_id,
++        "performance_state": "P0",
++        "throttle_reasons": "None",
++    }
++
++
++def generate_gpu_snapshot(gpu: dict, tick: float) -> dict:
++    """Return one polling snapshot for a GPU, adding dynamic fields."""
++    mem_total = gpu["memory_total"]
++    base_util = gpu.get("_base_util", 45.0)
++    util = _walk(gpu.get("_util", base_util), 8.0, 0, 100)
++    gpu["_util"] = util
++
++    mem_used = round(mem_total * (util / 100.0) * random.uniform(0.6, 1.4))
++    mem_used = max(128, min(mem_total - 128, mem_used))
++
++    temp = _walk(gpu.get("_temp", 55.0), 3.0, 28, 92)
++    gpu["_temp"] = temp
++
++    power = _walk(gpu.get("_power", 180.0), 15.0, 15, 450)
++    gpu["_power"] = power
++
++    fan = _walk(gpu.get("_fan", 45.0), 5.0, 20, 100)
++    gpu["_fan"] = fan
++
++    clock_gfx = _walk(gpu.get("_clock_gfx", 1800.0), 75.0, 300, 3000)
++    gpu["_clock_gfx"] = clock_gfx
++    clock_sm = _walk(gpu.get("_clock_sm", clock_gfx), 75.0, 300, 3000)
++    gpu["_clock_sm"] = clock_sm
++    clock_mem = _walk(gpu.get("_clock_mem", 10500.0), 500.0, 810, 24000)
++    gpu["_clock_mem"] = clock_mem
++    clock_video = _walk(gpu.get("_clock_video", 1500.0), 50.0, 300, 2100)
++    gpu["_clock_video"] = clock_video
++
++    snapshot = {
++        **gpu,
++        "timestamp": datetime.now(timezone.utc).isoformat(),
++        "utilization": util,
++        "memory_utilization": round((mem_used / mem_total) * 100, 1),
++        "memory_used": mem_used,
++        "memory_free": mem_total - mem_used,
++        "temperature": temp,
++        "temperature_memory": round(temp * random.uniform(0.85, 1.05), 0),
++        "power_draw": power,
++        "power_limit": round(power * 1.4, 0),
++        "fan_speed": fan,
++        "fan_speeds": [fan, round(fan * random.uniform(0.9, 1.1), 0)],
++        "clock_graphics": clock_gfx,
++        "clock_sm": clock_sm,
++        "clock_memory": clock_mem,
++        "clock_video": clock_video,
++        "clock_graphics_max": 3000,
++        "clock_sm_max": 3000,
++        "clock_memory_max": 24000,
++        "clock_video_max": 2100,
++        "encoder_utilization": round(util * random.uniform(0, 0.3), 1),
++        "encoder_sessions": max(0, int(util / 30)),
++        "pcie_tx_throughput": round(util * 12.5, 0),
++        "pcie_rx_throughput": round(util * 18.0, 0),
++    }
++
++    # make every snapshot a flat dict so the frontend sees everything
++    return {k: v for k, v in snapshot.items() if not k.startswith("_")}
++
++
++def generate_processes(gpus_snapshot: dict[str, dict]) -> list[dict]:
++    """Return a synthetic process list matching real fields."""
++    procs: list[dict] = []
++    proc_templates = [
++        ("python3.11", 34521), ("python3.11", 34522), ("python3.11", 34523),
++        ("pt_data_worker", 40100), ("torchrun", 40200),
++        ("ollama_runner", 50010), ("vllm.worker", 51010),
++    ]
++    for gpu_id, snap in gpus_snapshot.items():
++        if snap.get("utilization", 0) < 5:
++            continue
++        count = random.randint(1, 3)
++        for _ in range(count):
++            tpl = random.choice(proc_templates)
++            procs.append({
++                "pid": str(tpl[1] + int(gpu_id) * 100 + random.randint(0, 50)),
++                "name": tpl[0],
++                "gpu_uuid": snap.get("uuid", ""),
++                "gpu_id": gpu_id,
++                "memory": round(snap.get("memory_used", 0) / (count + 1) * random.uniform(0.5, 1.2), 0),
++            })
++    return procs
++
++
++def generate_system_info() -> dict:
++    """Synthetic OS-level metrics (psutil shape)."""
++    cpu = _walk(30.0, 8.0, 1, 100)
++    mem_pct = _walk(45.0, 3.0, 10, 98)
++    return {
++        "cpu_percent": cpu,
++        "memory_percent": mem_pct,
++        "memory_total_gb": 256.0,
++        "memory_used_gb": round(256.0 * mem_pct / 100.0, 1),
++        "memory_available_gb": round(256.0 * (100 - mem_pct) / 100.0, 1),
++        "cpu_count": 64,
++        "timestamp": datetime.now(timezone.utc).isoformat(),
++        "swap_percent": round(mem_pct * 0.3, 1),
++        "cpu_freq_current": 3200,
++        "cpu_freq_max": 3800,
++        "load_avg_1": round(cpu / 100.0 * 8, 2),
++        "load_avg_5": round(cpu / 100.0 * 6, 2),
++        "load_avg_15": round(cpu / 100.0 * 5, 2),
++        "net_bytes_sent": random.randint(10**9, 10**11),
++        "net_bytes_recv": random.randint(10**9, 10**11),
++        "disk_read_bytes": random.randint(10**10, 10**12),
++        "disk_write_bytes": random.randint(10**10, 10**12),
++    }
++
++
++# ── default-mode WebSocket loop ──────────────────────────────────────────
++
++class MockDefaultNode:
++    """Simulate a single gpu-hot node with N GPUs."""
++
++    def __init__(self, node_name: str, gpu_count: int):
++        self.node_name = node_name
++        self.gpu_count = gpu_count
++        self.connections: set[WebSocket] = set()
++        self.running = False
++
++        rng = random.Random(42)
++        presets = rng.sample(GPU_PRESETS, min(gpu_count, len(GPU_PRESETS)))
++        if gpu_count > len(presets):
++            presets += rng.choices(GPU_PRESETS, k=gpu_count - len(presets))
++
++        self._gpus: dict[str, dict] = {}
++        for i in range(gpu_count):
++            gid = str(i)
++            gpu = dict(presets[i % len(presets)])
++            gpu.update(_make_static_gpu(presets[i % len(presets)], gid, f"00000000:{i+1:02X}:00.0"))
++            self._gpus[gid] = gpu
++
++    async def broadcast_loop(self):
++        while self.running:
++            try:
++                tick = time.monotonic()
++                snapshots = {gid: generate_gpu_snapshot(g, tick) for gid, g in self._gpus.items()}
++                procs = generate_processes(snapshots)
++                sysinfo = generate_system_info()
++
++                payload = {
++                    "mode": "default",
++                    "node_name": self.node_name,
++                    "gpus": snapshots,
++                    "processes": procs,
++                    "system": sysinfo,
++                }
++                text = json.dumps(payload, default=str)
++
++                disc: set[WebSocket] = set()
++                for ws in list(self.connections):
++                    try:
++                        await ws.send_text(text)
++                    except Exception:
++                        disc.add(ws)
++                self.connections -= disc
++            except Exception:
++                logging.getLogger("mock").exception("broadcast error")
++            await asyncio.sleep(0.5)
++
++    async def handle_ws(self, websocket: WebSocket):
++        await websocket.accept()
++        self.connections.add(websocket)
++        if not self.running:
++            self.running = True
++            asyncio.create_task(self.broadcast_loop())
++        try:
++            while True:
++                await websocket.receive_text()
++        except Exception:
++            pass
++        finally:
++            self.connections.discard(websocket)
++
++
++# ── hub-mode internals ───────────────────────────────────────────────────
++
++class MockHubNodeHandle:
++    """Track one simulated node: its GPUs, status, and last data."""
++
++    def __init__(self, node_name: str, gpu_count: int):
++        self.node_name = node_name
++        self.status: str = "online"
++        self.last_update: str | None = None
++
++        rng = random.Random(hash(node_name) & 0xFFFFFFFF)
++        presets = rng.sample(GPU_PRESETS, min(gpu_count, len(GPU_PRESETS)))
++        if gpu_count > len(presets):
++            presets += rng.choices(GPU_PRESETS, k=gpu_count - len(presets))
++
++        self._gpus: dict[str, dict] = {}
++        for i in range(gpu_count):
++            gid = str(i)
++            gpu = dict(presets[i % len(presets)])
++            gpu.update(_make_static_gpu(presets[i % len(presets)], gid, f"00000000:{i+1:02X}:00.0"))
++            self._gpus[gid] = gpu
++
++    def snapshot(self) -> dict:
++        tick = time.monotonic()
++        snapshots = {gid: generate_gpu_snapshot(g, tick) for gid, g in self._gpus.items()}
++        self.last_update = datetime.now(timezone.utc).isoformat()
++        return {
++            "status": self.status,
++            "gpus": snapshots,
++            "processes": generate_processes(snapshots) if self.status == "online" else [],
++            "system": generate_system_info() if self.status == "online" else {},
++            "last_update": self.last_update if self.status == "online" else None,
++        }
++
++    def set_online(self):
++        self.status = "online"
++        self.last_update = datetime.now(timezone.utc).isoformat()
++
++    def set_offline(self):
++        self.status = "offline"
++
++
++class MockHub:
++    """Aggregate multiple simulated nodes and emit hub-mode JSON."""
++
++    def __init__(self, node_names: list[str], gpus_per_node: int, scenario: str):
++        self.nodes: dict[str, MockHubNodeHandle] = {
++            name: MockHubNodeHandle(name, gpus_per_node) for name in node_names
++        }
++        self.scenario = scenario
++        self.connections: set[WebSocket] = set()
++        self.running = False
++
++    async def _scenario_runner(self):
++        if self.scenario == "none":
++            return
++        if self.scenario not in ("random-offline", "rolling-offline", "mixed"):
++            return
++
++        while self.running:
++            await asyncio.sleep(random.uniform(8, 20))
++
++            online = [n for n in self.nodes.values() if n.status == "online"]
++            offline = [n for n in self.nodes.values() if n.status == "offline"]
++
++            if self.scenario == "random-offline":
++                if online and (not offline or random.random() < 0.6):
++                    node = random.choice(online)
++                    node.set_offline()
++                    logging.getLogger("mock").info("[-] %s → offline", node.node_name)
++                if offline and random.random() < 0.5:
++                    node = random.choice(offline)
++                    node.set_online()
++                    logging.getLogger("mock").info("[+] %s → online", node.node_name)
++
++            elif self.scenario == "rolling-offline":
++                # cycle through nodes one at a time
++                if offline:
++                    for n in list(offline):
++                        n.set_online()
++                        logging.getLogger("mock").info("[+] %s → online", n.node_name)
++                elif online:
++                    node = online[0]
++                    node.set_offline()
++                    logging.getLogger("mock").info("[-] %s → offline", node.node_name)
++
++            elif self.scenario == "mixed":
++                # keep at least one online, toggle others randomly
++                if random.random() < 0.5 and len(online) > 1:
++                    node = random.choice(online)
++                    node.set_offline()
++                    logging.getLogger("mock").info("[-] %s → offline", node.node_name)
++                if offline and random.random() < 0.6:
++                    node = random.choice(offline)
++                    node.set_online()
++                    logging.getLogger("mock").info("[+] %s → online", node.node_name)
++
++    async def broadcast_loop(self):
++        while self.running:
++            try:
++                nodes_data = {name: n.snapshot() for name, n in self.nodes.items()}
++                online_count = sum(1 for nd in nodes_data.values() if nd["status"] == "online")
++                total_gpus = sum(len(nd["gpus"]) for nd in nodes_data.values() if nd["status"] == "online")
++
++                payload = {
++                    "mode": "hub",
++                    "nodes": nodes_data,
++                    "cluster_stats": {
++                        "total_nodes": len(self.nodes),
++                        "online_nodes": online_count,
++                        "total_gpus": total_gpus,
++                    },
++                }
++                text = json.dumps(payload, default=str)
++
++                disc: set[WebSocket] = set()
++                for ws in list(self.connections):
++                    try:
++                        await ws.send_text(text)
++                    except Exception:
++                        disc.add(ws)
++                self.connections -= disc
++            except Exception:
++                logging.getLogger("mock").exception("hub broadcast error")
++            await asyncio.sleep(0.5)
++
++    async def handle_ws(self, websocket: WebSocket):
++        await websocket.accept()
++        self.connections.add(websocket)
++        if not self.running:
++            self.running = True
++            asyncio.create_task(self.broadcast_loop())
++            asyncio.create_task(self._scenario_runner())
++        try:
++            while True:
++                await websocket.receive_text()
++        except Exception:
++            pass
++        finally:
++            self.connections.discard(websocket)
++
++
++# ── FastAPI app ──────────────────────────────────────────────────────────
++
++def build_app(args: argparse.Namespace) -> FastAPI:
++    ROOT = Path(__file__).resolve().parent
++
++    app = FastAPI(title="GPU Hot Mock", version="0.0.0")
++
++    if args.mode == "hub":
++        node_names = [f"node-{i+1:02d}" for i in range(args.nodes)]
++        hub = MockHub(node_names, args.gpus, args.scenario)
++
++        @app.websocket("/socket.io/")
++        async def ws_hub(websocket: WebSocket):
++            await hub.handle_ws(websocket)
++
++    else:
++        node = MockDefaultNode(f"mock-{args.gpus}gpu", args.gpus)
++
++        @app.websocket("/socket.io/")
++        async def ws_default(websocket: WebSocket):
++            await node.handle_ws(websocket)
++
++    # static files
++    static_dir = ROOT / "static"
++    if static_dir.is_dir():
++        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
++
++    @app.get("/")
++    async def index():
++        tmpl = ROOT / "templates" / "index.html"
++        if tmpl.is_file():
++            return HTMLResponse(content=tmpl.read_text())
++        return HTMLResponse(content="<h1>index.html not found</h1>", status_code=404)
++
++    return app
++
++
++# ── CLI ──────────────────────────────────────────────────────────────────
++
++def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
++    p = argparse.ArgumentParser(
++        description="GPU Hot Mock Server — local debug tool (no GPU needed)",
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        epilog="""\
++examples:
++  python mock_server.py                             # default mode, 4 GPUs
++  python mock_server.py --mode hub                  # hub mode, 3 nodes × 2 GPUs
++  python mock_server.py --mode hub --scenario random-offline  # node up/down sim
++  python mock_server.py --mode hub --nodes 5 --gpus 4 --port 8080
++        """,
++    )
++    p.add_argument("--mode", choices=["default", "hub"], default="default",
++                   help="Operation mode (default: %(default)s)")
++    p.add_argument("--nodes", type=int, default=3,
++                   help="Number of simulated nodes in hub mode (default: %(default)s)")
++    p.add_argument("--gpus", type=int, default=4,
++                   help="GPUs per node (default: %(default)s)")
++    p.add_argument("--port", type=int, default=1313,
++                   help="HTTP port (default: %(default)s)")
++    p.add_argument("--host", default="0.0.0.0",
++                   help="Bind address (default: %(default)s)")
++    p.add_argument("--scenario",
++                   choices=["none", "random-offline", "rolling-offline", "mixed"],
++                   default="none",
++                   help="Node lifecycle scenario for hub mode (default: %(default)s)")
++    return p.parse_args(argv)
++
++
++def main():
++    args = parse_args()
++    logging.basicConfig(
++        level=logging.INFO,
++        format="%(asctime)s [mock] %(levelname)s %(message)s",
++    )
++    log = logging.getLogger("mock")
++
++    if args.mode == "hub":
++        log.info("mode=hub  nodes=%d  gpus_per_node=%d  scenario=%s",
++                 args.nodes, args.gpus, args.scenario)
++    else:
++        log.info("mode=default  gpus=%d", args.gpus)
++
++    app = build_app(args)
++
++    import uvicorn
++    log.info("listening on http://%s:%d", args.host, args.port)
++    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
